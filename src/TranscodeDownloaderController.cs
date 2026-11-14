@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using MediaBrowser.Common.Configuration;
+using MediaBrowser.Common.Net;
+using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Configuration;
 using MediaBrowser.Model.Entities;
@@ -50,18 +52,129 @@ namespace Jellyfin.Plugin.TranscodeDownloader
         /// <summary>Guards the one-shot capability log line (0 = not yet logged).</summary>
         private static int _capabilitiesLogged;
 
+        /// <summary>Jellyfin.Api's InternalClaimTypes.UserId (that assembly is not a package).</summary>
+        private const string UserIdClaim = "Jellyfin-UserId";
+
+        /// <summary>Audio is always encoded at 256 kbps (Jellyfin's -ab for stereo AAC/Opus).</summary>
+        private const long AudioBitrate = 256_000;
+
+        /// <summary>VBR outputs land within ±10–15% of target; size checks use the upper end.</summary>
+        private const double SizeMargin = 1.15;
+
+        private const int RetryAfterSeconds = 20;
+
         private readonly IMediaEncoder _mediaEncoder;
         private readonly IConfigurationManager _configurationManager;
+        private readonly ILibraryManager _libraryManager;
+        private readonly IUserManager _userManager;
+        private readonly INetworkManager _networkManager;
+        private readonly DownloadLimiter _limiter;
         private readonly ILogger<TranscodeDownloaderController> _logger;
 
         public TranscodeDownloaderController(
             IMediaEncoder mediaEncoder,
             IConfigurationManager configurationManager,
+            ILibraryManager libraryManager,
+            IUserManager userManager,
+            INetworkManager networkManager,
+            DownloadLimiter limiter,
             ILogger<TranscodeDownloaderController> logger)
         {
             _mediaEncoder = mediaEncoder;
             _configurationManager = configurationManager;
+            _libraryManager = libraryManager;
+            _userManager = userManager;
+            _networkManager = networkManager;
+            _limiter = limiter;
             _logger = logger;
+        }
+
+        /// <summary>
+        /// POST /TranscodeDownloader/Tickets — asks for a download slot. The returned ticket goes
+        /// on the stream URL as <c>TdTicket</c>; <see cref="DownloadPacingFilter"/> then paces that
+        /// response and frees the slot when it ends. 429 when the user or server is at its limit,
+        /// 507 when the transcode folder has no room for the estimated output.
+        /// </summary>
+        [HttpPost("Tickets")]
+        [Authorize]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        [ProducesResponseType(StatusCodes.Status429TooManyRequests)]
+        [ProducesResponseType(StatusCodes.Status507InsufficientStorage)]
+        public ActionResult<TicketResponseDto> CreateTicket([FromBody] TicketRequestDto request)
+        {
+            if (!Guid.TryParse(User.FindFirst(UserIdClaim)?.Value, out var userId))
+            {
+                return Forbid();
+            }
+
+            var user = _userManager.GetUserById(userId);
+            var item = request.ItemId == Guid.Empty ? null : _libraryManager.GetItemById(request.ItemId);
+            if (user is null || item is null || !item.IsVisibleStandalone(user))
+            {
+                return NotFound();
+            }
+
+            var videoBitrate = Math.Clamp(request.VideoBitrate, 100_000, 200_000_000);
+            var seconds = (item.RunTimeTicks ?? 0) / (double)TimeSpan.TicksPerSecond;
+            var estimatedBytes = (long)((videoBitrate + AudioBitrate) * seconds / 8);
+
+            var result = _limiter.TryIssue(userId, item.Id, (long)(estimatedBytes * SizeMargin), _configurationManager.GetTranscodePath());
+            switch (result.Outcome)
+            {
+                case TicketOutcome.Granted:
+                    var rate = CurrentClientRateBps();
+                    _logger.LogInformation(
+                        "[TranscodeDownloader] Ticket for {User}: {Item} at {Bitrate} bps, ~{Megabytes:F0} MB, paced={Paced}",
+                        user.Username,
+                        item.Name,
+                        videoBitrate,
+                        estimatedBytes / 1_000_000.0,
+                        rate > 0);
+                    return new TicketResponseDto
+                    {
+                        Ticket = result.Slot!.Ticket,
+                        EstimatedBytes = estimatedBytes,
+                        Paced = rate > 0,
+                        RateBps = rate,
+                        EtaSeconds = rate > 0 ? (long)(estimatedBytes * 8 / (double)rate) : 0,
+                    };
+
+                case TicketOutcome.NoSpace:
+                    _logger.LogWarning(
+                        "[TranscodeDownloader] Refused {User}'s download of {Item}: needs {Needed} bytes, {Free} free in the transcode folder",
+                        user.Username,
+                        item.Name,
+                        result.NeededBytes,
+                        result.FreeBytes);
+                    return StatusCode(StatusCodes.Status507InsufficientStorage, new TicketRefusalDto
+                    {
+                        Reason = "no_space",
+                        NeededBytes = result.NeededBytes,
+                        FreeBytes = result.FreeBytes,
+                    });
+
+                default:
+                    Response.Headers["Retry-After"] = RetryAfterSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return StatusCode(StatusCodes.Status429TooManyRequests, new TicketRefusalDto
+                    {
+                        Reason = result.Outcome == TicketOutcome.UserBusy ? "user_busy" : "server_busy",
+                        RetryAfterSeconds = RetryAfterSeconds,
+                    });
+            }
+        }
+
+        /// <summary>The rate this client's download would get on its own, in bps; 0 when it is not paced.</summary>
+        private long CurrentClientRateBps()
+        {
+            var config = DownloadLimiter.Config;
+            var address = HttpContext.Connection.RemoteIpAddress;
+            if (config.ExemptLan && address is not null && _networkManager.IsInLocalNetwork(address))
+            {
+                return 0;
+            }
+
+            return (long)(DownloadLimiter.EffectiveRateBytesPerSecond() * 8);
         }
 
         /// <summary>
@@ -121,6 +234,16 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                     .Select(c => ResolveVideoCodec(c.Codec, c.SoftwareEncoder, c.HardwarePrefix, options))
                     .ToList(),
                 AudioCodecs = AudioCodecs.Select(ResolveAudioCodec).ToList(),
+            };
+
+            var limitsConfig = DownloadLimiter.Config;
+            var clientRate = CurrentClientRateBps();
+            result.Limits = new DownloadLimitsDto
+            {
+                Paced = clientRate > 0,
+                RateBps = clientRate,
+                MaxPerUser = limitsConfig.MaxPerUser,
+                MaxGlobal = limitsConfig.MaxGlobal,
             };
 
             // Logged once per process so support tickets can be diagnosed from the server log.

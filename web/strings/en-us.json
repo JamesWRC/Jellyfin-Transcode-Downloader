@@ -15,5 +15,10 @@
     "DownloadFailedStatus": "Download failed (HTTP {status}).",
     "BrowserHandoffHint": "The Jellyfin Android app cannot save downloads itself, so this opens in your browser. The file is saved as stream.mp4 — rename it afterwards.",
     "BrowserHandoffStarted": "Handed to your browser — check its downloads.",
-    "BrowserHandoffFailed": "Could not open your browser."
+    "BrowserHandoffFailed": "Could not open your browser.",
+    "WaitingForOwnDownload": "Waiting for your other download to finish…",
+    "WaitingForServerSlot": "Server busy — waiting for a free download slot…",
+    "NoSpace": "The server has no room for this download right now. Try a lower quality, or try again later.",
+    "ServerBusyTryLater": "The server is busy with other downloads. Try again in a minute.",
+    "TimeLeft": "~{time} left"
 }

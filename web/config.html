@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Transcode Downloader</title>
+</head>
+<body>
+    <div id="TranscodeDownloaderConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox">
+        <div data-role="content">
+            <div class="content-primary">
+                <form id="TranscodeDownloaderConfigForm">
+                    <div class="verticalSection">
+                        <h2 class="sectionTitle">Download speed</h2>
+                        <p>Without a limit, a transcoded download is sent as fast as the GPU can encode it, often 20&ndash;60&times; realtime, which competes with every stream for the server's upload. Slowing the transfer also slows the encode: Jellyfin pauses ffmpeg once it gets ahead of the download (Dashboard &rarr; Playback &rarr; Transcoding &rarr; throttling).</p>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="number" id="PerDownloadMbps" min="0" step="1" label="Per-download limit (Mbps)" />
+                        <div class="fieldDescription">The fastest one download is sent. 0 = no limit.</div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="number" id="TotalMbps" min="0" step="1" label="Total limit for all downloads (Mbps)" />
+                        <div class="fieldDescription">Shared by every download at once. 0 = no limit.</div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" id="ExemptLan" />
+                            <span>Don't limit clients on the local network</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">Their traffic never uses the internet upload. They still use a download slot.</div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" id="PaceNativeDownloads" />
+                            <span>Also limit Jellyfin's own Download button</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">Original-file downloads share the total limit. They need no slot.</div>
+                    </div>
+
+                    <div class="verticalSection">
+                        <h2 class="sectionTitle">Download slots</h2>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="number" id="MaxGlobal" min="0" step="1" label="Downloads at once, whole server" />
+                        <div class="fieldDescription">Each running download holds one hardware-encoder session until it finishes. 0 = no limit.</div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="number" id="MaxPerUser" min="0" step="1" label="Downloads at once, per user" />
+                        <div class="fieldDescription">Extra downloads wait in the user's queue until a slot frees. 0 = no limit.</div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="number" id="HeadroomGb" min="0" step="0.5" label="Transcode folder space to keep free (GB)" />
+                        <div class="fieldDescription">A download's whole output is written to the transcode folder until it finishes. A download is refused if it would leave less than this free.</div>
+                    </div>
+
+                    <div>
+                        <button is="emby-button" type="submit" class="raised button-submit block emby-button">
+                            <span>Save</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        <script type="text/javascript">
+            (function () {
+                var pluginId = 'a4b5c6d7-e8f9-0a1b-2c3d-4e5f6a7b8c9d';
+                var numbers = ['PerDownloadMbps', 'TotalMbps', 'MaxGlobal', 'MaxPerUser', 'HeadroomGb'];
+                var checks = ['ExemptLan', 'PaceNativeDownloads'];
+                var page = document.querySelector('#TranscodeDownloaderConfigPage');
+
+                page.addEventListener('pageshow', function () {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                        numbers.forEach(function (key) { page.querySelector('#' + key).value = config[key]; });
+                        checks.forEach(function (key) { page.querySelector('#' + key).checked = !!config[key]; });
+                        Dashboard.hideLoadingMsg();
+                    });
+                });
+
+                page.querySelector('#TranscodeDownloaderConfigForm').addEventListener('submit', function (e) {
+                    e.preventDefault();
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                        numbers.forEach(function (key) {
+                            var raw = page.querySelector('#' + key).value;
+                            // MaxGlobal/MaxPerUser are ints on the server; a fraction would fail to deserialise.
+                            var value = key.indexOf('Max') === 0 ? parseInt(raw, 10) : parseFloat(raw);
+                            config[key] = isNaN(value) || value < 0 ? 0 : value;
+                        });
+                        checks.forEach(function (key) { config[key] = page.querySelector('#' + key).checked; });
+                        ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
+                            Dashboard.processPluginConfigurationUpdateResult(result);
+                        });
+                    });
+                    return false;
+                });
+            })();
+        </script>
+    </div>
+</body>
+</html>

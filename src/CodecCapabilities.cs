@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace Jellyfin.Plugin.TranscodeDownloader
@@ -17,6 +18,57 @@ namespace Jellyfin.Plugin.TranscodeDownloader
 
         /// <summary>Audio codecs offered by the download UI, in display order.</summary>
         public IReadOnlyList<CodecCapabilityDto> AudioCodecs { get; set; } = new List<CodecCapabilityDto>();
+
+        /// <summary>Download limits as they apply to the requesting client (additive).</summary>
+        public DownloadLimitsDto? Limits { get; set; }
+    }
+
+    /// <summary>The download limits, so the sheet can show how long each tier will take.</summary>
+    public class DownloadLimitsDto
+    {
+        /// <summary>False when this client is exempt (on the local network) or no rate limit is set.</summary>
+        public bool Paced { get; set; }
+
+        /// <summary>Rate one download gets on its own, in bits per second (0 when not paced).</summary>
+        public long RateBps { get; set; }
+
+        public int MaxPerUser { get; set; }
+
+        public int MaxGlobal { get; set; }
+    }
+
+    public class TicketRequestDto
+    {
+        public Guid ItemId { get; set; }
+
+        /// <summary>Requested video bitrate in bits per second.</summary>
+        public long VideoBitrate { get; set; }
+    }
+
+    public class TicketResponseDto
+    {
+        public string Ticket { get; set; } = string.Empty;
+
+        public long EstimatedBytes { get; set; }
+
+        public bool Paced { get; set; }
+
+        public long RateBps { get; set; }
+
+        /// <summary>Seconds the transfer takes at <see cref="RateBps"/> on its own; 0 when not paced.</summary>
+        public long EtaSeconds { get; set; }
+    }
+
+    public class TicketRefusalDto
+    {
+        /// <summary>user_busy, server_busy or no_space.</summary>
+        public string Reason { get; set; } = string.Empty;
+
+        public int RetryAfterSeconds { get; set; }
+
+        public long NeededBytes { get; set; }
+
+        public long FreeBytes { get; set; }
     }
 
     /// <summary>

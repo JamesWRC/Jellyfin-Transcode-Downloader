@@ -49,6 +49,10 @@
     // H.264/AAC and hides the selectors rather than guessing what the server can do.
     let codecCapabilitiesResolved = false;
     let codecCapabilitiesPromise = null;
+    // { paced, rateBps } from the server, or null when unknown. Only used to label tiers.
+    let downloadLimits = null;
+    // Jellyfin always encodes the audio at 256 kbps; it counts towards the file size.
+    const AUDIO_BITRATE = 256_000;
 
     function findCodec(catalogue, id) {
         return catalogue.find(codec => codec.id === id) || null;
@@ -104,6 +108,11 @@
         BrowserHandoffHint: 'The Jellyfin Android app cannot save downloads itself, so this opens in your browser. The file is saved as stream.mp4 — rename it afterwards.',
         BrowserHandoffStarted: 'Handed to your browser — check its downloads.',
         BrowserHandoffFailed: 'Could not open your browser.',
+        WaitingForOwnDownload: 'Waiting for your other download to finish…',
+        WaitingForServerSlot: 'Server busy — waiting for a free download slot…',
+        NoSpace: 'The server has no room for this download right now. Try a lower quality, or try again later.',
+        ServerBusyTryLater: 'The server is busy with other downloads. Try again in a minute.',
+        TimeLeft: '~{time} left',
     };
 
     // Populated by initStrings(); null until loaded.
@@ -217,6 +226,60 @@
         return token ? { Authorization: `MediaBrowser Token="${token}"` } : {};
     }
 
+    // --- Download tickets ---
+
+    // The server hands out a ticket per download: it checks the user's and the server's download
+    // slots and that the transcode folder has room for the output, and the ticket on the stream
+    // URL is what makes the server pace the transfer. Returns { status, body }.
+    async function requestTicket(entry, signal) {
+        const res = await fetch(`${entry.baseUrl}/TranscodeDownloader/Tickets`, {
+            method: 'POST',
+            headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders(entry.token)),
+            body: JSON.stringify({ ItemId: entry.itemId, VideoBitrate: entry.bitrate }),
+            signal,
+        });
+        let body = null;
+        try { body = await res.json(); } catch (_) { /* 4xx/5xx without a body */ }
+        return { status: res.status, body };
+    }
+
+    function waitFor(ms, signal) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(resolve, ms);
+            if (signal) {
+                signal.addEventListener('abort', () => {
+                    clearTimeout(timer);
+                    reject(new DOMException('Aborted', 'AbortError'));
+                }, { once: true });
+            }
+        });
+    }
+
+    function formatSize(bytes) {
+        if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+        return `${Math.max(1, Math.round(bytes / 1e6))} MB`;
+    }
+
+    function formatDuration(seconds) {
+        if (seconds < 90) return `${Math.max(1, Math.round(seconds))} s`;
+        const minutes = Math.round(seconds / 60);
+        if (minutes < 90) return `${minutes} min`;
+        const hours = Math.floor(minutes / 60);
+        return `${hours} h ${minutes % 60} min`;
+    }
+
+    // Size, and how long the transfer takes when this client is paced, for a tier label.
+    function tierEstimate(videoBitrate, item) {
+        const seconds = item && item.RunTimeTicks ? item.RunTimeTicks / 10_000_000 : 0;
+        if (!seconds) return '';
+        const bytes = (videoBitrate + AUDIO_BITRATE) * seconds / 8;
+        let text = ` · ~${formatSize(bytes)}`;
+        if (downloadLimits && downloadLimits.paced && downloadLimits.rateBps > 0) {
+            text += ` · ~${formatDuration(bytes * 8 / downloadLimits.rateBps)}`;
+        }
+        return text;
+    }
+
     function buildStopUrl(baseUrl, deviceId, playSessionId) {
         return `${baseUrl}/Videos/ActiveEncodings?deviceId=${encodeURIComponent(deviceId)}`
             + `&playSessionId=${playSessionId}`;
@@ -316,7 +379,30 @@
             renderQueue();
 
             try {
-                const response = await fetch(entry.url, { signal: entry.abortController.signal, headers: authHeaders(entry.token) });
+                const signal = entry.abortController.signal;
+                let ticket = null;
+                while (!ticket) {
+                    const { status, body } = await requestTicket(entry, signal);
+                    if (status === 200 && body) {
+                        ticket = body;
+                    } else if (status === 429) {
+                        const reason = readField(body, 'Reason');
+                        updateEntryStatus(entry, t(reason === 'user_busy' ? 'WaitingForOwnDownload' : 'WaitingForServerSlot'));
+                        await waitFor((Number(readField(body, 'RetryAfterSeconds')) || 20) * 1000, signal);
+                    } else if (status === 507) {
+                        const noSpace = new Error('no space');
+                        noSpace.userMessage = t('NoSpace');
+                        throw noSpace;
+                    } else {
+                        const httpError = new Error(`HTTP ${status}`);
+                        httpError.status = status;
+                        throw httpError;
+                    }
+                }
+                entry.estimatedBytes = Number(readField(ticket, 'EstimatedBytes')) || entry.estimatedBytes;
+                entry.startedAt = Date.now();
+                const url = `${entry.url}&TdTicket=${encodeURIComponent(readField(ticket, 'Ticket'))}`;
+                const response = await fetch(url, { signal, headers: authHeaders(entry.token) });
                 if (!response.ok) {
                     const httpError = new Error(`HTTP ${response.status}`);
                     httpError.status = response.status;
@@ -351,6 +437,7 @@
     // server accepted and then failed to deliver a single byte for points at an encoder that
     // Jellyfin resolves to but FFmpeg does not actually have.
     function describeFailure(entry, err) {
+        if (err && err.userMessage) return err.userMessage;
         if (err && err.status) return t('DownloadFailedStatus').replace('{status}', err.status);
         if (!entry.receivedBytes && entry.videoCodec && entry.videoCodec !== DEFAULT_VIDEO_CODEC) {
             return t('DownloadFailedCodec').replace('{codec}', codecLabel(VIDEO_CODECS, entry.videoCodec));
@@ -493,9 +580,16 @@
 
         const receivedMB = receivedBytes != null ? (receivedBytes / 1_048_576).toFixed(1) : null;
         const estimatedMB = (estimatedBytes / 1_048_576).toFixed(1);
-        statusEl.textContent = receivedMB != null
+        let text = receivedMB != null
             ? `${receivedMB} MB / ~${estimatedMB} MB · ${pct}%`
             : `~${estimatedMB} MB · ${pct}%`;
+        // Remaining time from the observed rate, once there is enough of it to mean something.
+        const elapsed = entry.startedAt ? (Date.now() - entry.startedAt) / 1000 : 0;
+        if (receivedBytes && elapsed > 5 && pct < 100) {
+            const remaining = Math.max(0, estimatedBytes - receivedBytes) / (receivedBytes / elapsed);
+            text += ` · ${t('TimeLeft').replace('{time}', formatDuration(remaining))}`;
+        }
+        statusEl.textContent = text;
     }
 
     function updateEntryStatus(entry, text) {
@@ -525,6 +619,27 @@
     // Handing the URL over ends this page's involvement: the browser owns the transfer, so there
     // is no progress, no cancel and no filename of ours — the file lands under the request path
     // as stream.mp4 because Jellyfin's stream endpoint sends no Content-Disposition.
+    // The browser still needs a ticket, or the server will not pace (or slot) the
+    // download. There is no queue here to wait in, so a busy server is reported instead.
+    async function handOffWithTicket(request, deviceId, playSessionId) {
+        let result;
+        try {
+            result = await requestTicket(request);
+        } catch (err) {
+            console.error('[TranscodeDownloader] ticket request failed:', err);
+            showTransientNotice(t('DownloadFailed'));
+            return;
+        }
+        if (result.status === 429) { showTransientNotice(t('ServerBusyTryLater')); return; }
+        if (result.status === 507) { showTransientNotice(t('NoSpace')); return; }
+        if (result.status !== 200 || !result.body) {
+            showTransientNotice(t('DownloadFailedStatus').replace('{status}', result.status));
+            return;
+        }
+        const url = `${request.url}&TdTicket=${encodeURIComponent(readField(result.body, 'Ticket'))}`;
+        handOffToBrowser(url, request.baseUrl, deviceId, playSessionId);
+    }
+
     function handOffToBrowser(url, baseUrl, deviceId, playSessionId) {
         try {
             window.NativeShell.openUrl(url);
@@ -732,6 +847,10 @@
                         audio: parseCapabilityList(readField(payload, 'AudioCodecs')),
                     };
                     codecCapabilitiesResolved = true;
+                    const limits = readField(payload, 'Limits');
+                    downloadLimits = limits
+                        ? { paced: !!readField(limits, 'Paced'), rateBps: Number(readField(limits, 'RateBps')) || 0 }
+                        : null;
                     selectedVideoCodec = resolveCodecPreference('video', STORAGE_VIDEO_CODEC, DEFAULT_VIDEO_CODEC);
                     selectedAudioCodec = resolveCodecPreference('audio', STORAGE_AUDIO_CODEC, DEFAULT_AUDIO_CODEC);
                     resolve();
@@ -998,7 +1117,7 @@
 
             for (const tier of tiers) {
                 const bitrate = scaleBitrate(tier.bitrate, factor);
-                const btn = makeMenuItem('video_settings', `${tier.resolution} · ${formatBitrate(bitrate)}`, () => {
+                const btn = makeMenuItem('video_settings', `${tier.resolution} · ${formatBitrate(bitrate)}${tierEstimate(bitrate, item)}`, () => {
                     scrim.remove();
                     onTranscodeMenuClick(bitrate, item.Id || itemId, item);
                 });
@@ -1068,7 +1187,7 @@
         // Nothing below this point applies inside the Android app: there is no queue entry, no
         // progress and no filename of ours once the browser owns the transfer.
         if (isAndroidAppWebView()) {
-            handOffToBrowser(url, baseUrl, deviceId, playSessionId);
+            handOffWithTicket({ baseUrl, itemId, token, bitrate: selectedBitrate, url }, deviceId, playSessionId);
             return;
         }
 
@@ -1098,6 +1217,10 @@
             url,
             stopUrl,
             token,
+            baseUrl,
+            itemId,
+            bitrate: selectedBitrate,
+            startedAt: 0,
             videoCodec,
             audioCodec,
             codecLabel: `${videoTag} · ${formatBitrate(selectedBitrate)} · ${audioTag}`,

@@ -13,6 +13,10 @@ namespace Jellyfin.Plugin.TranscodeDownloader
             // middleware pipeline (no File Transformation dependency, no disk writes).
             serviceCollection.AddTransient<IStartupFilter, IndexHtmlInjectionFilter>();
 
+            // Download slots, free-space guard and transfer-rate pacing.
+            serviceCollection.AddSingleton<DownloadLimiter>();
+            serviceCollection.AddTransient<IStartupFilter, DownloadPacingFilter>();
+
             // Secondary path: also try File Transformation plugin registration + on-disk fallback.
             serviceCollection.AddHostedService<StartupTask>();
         }
