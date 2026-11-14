@@ -195,7 +195,7 @@
         const stopUrl = entry.stopUrl;
         entry.stopUrl = null; // never fire twice for the same job
         try {
-            fetch(stopUrl, { method: 'DELETE', keepalive: true }).catch((err) => {
+            fetch(stopUrl, { method: 'DELETE', keepalive: true, headers: authHeaders(entry.token) }).catch((err) => {
                 console.warn('[TranscodeDownloader] failed to stop server transcode:', err);
             });
         } catch (err) {
@@ -210,9 +210,16 @@
         downloadQueue.forEach(stopActiveEncoding);
     });
 
-    function buildStopUrl(baseUrl, deviceId, playSessionId, token) {
+    // Jellyfin 12 disables legacy authorization, so `?api_key=` and X-Emby-Token are
+    // rejected with 401 and only `Authorization: MediaBrowser Token="…"` is accepted. Every
+    // authenticated request sends the token this way, never in a URL.
+    function authHeaders(token) {
+        return token ? { Authorization: `MediaBrowser Token="${token}"` } : {};
+    }
+
+    function buildStopUrl(baseUrl, deviceId, playSessionId) {
         return `${baseUrl}/Videos/ActiveEncodings?deviceId=${encodeURIComponent(deviceId)}`
-            + `&playSessionId=${playSessionId}&api_key=${token}`;
+            + `&playSessionId=${playSessionId}`;
     }
 
     // --- Deferred transcode cleanup (browser handoff only) ---
@@ -264,8 +271,8 @@
             const token = client.accessToken();
             const baseUrl = client.serverAddress() || window.location.origin;
             due.forEach((entry) => {
-                const url = buildStopUrl(entry.baseUrl || baseUrl, entry.deviceId, entry.playSessionId, token);
-                fetch(url, { method: 'DELETE' }).catch((err) => {
+                const url = buildStopUrl(entry.baseUrl || baseUrl, entry.deviceId, entry.playSessionId);
+                fetch(url, { method: 'DELETE', headers: authHeaders(token) }).catch((err) => {
                     console.warn('[TranscodeDownloader] deferred transcode stop failed:', err);
                 });
             });
@@ -309,7 +316,7 @@
             renderQueue();
 
             try {
-                const response = await fetch(entry.url, { signal: entry.abortController.signal });
+                const response = await fetch(entry.url, { signal: entry.abortController.signal, headers: authHeaders(entry.token) });
                 if (!response.ok) {
                     const httpError = new Error(`HTTP ${response.status}`);
                     httpError.status = response.status;
@@ -716,7 +723,7 @@
             getApiClient(0, 10, async (client) => {
                 try {
                     const baseUrl = client.serverAddress() || window.location.origin;
-                    const res = await fetch(`${baseUrl}/TranscodeDownloader/Codecs?api_key=${encodeURIComponent(client.accessToken())}`);
+                    const res = await fetch(`${baseUrl}/TranscodeDownloader/Codecs`, { headers: authHeaders(client.accessToken()) });
                     if (!res.ok) throw new Error(`HTTP ${res.status}`);
                     const payload = await res.json();
 
@@ -1051,9 +1058,13 @@
         // session's transcoding info in the dashboard.
         const playSessionId = randomId();
         const deviceId = `transcode-downloader-${playSessionId}`;
+        // No token in the URL. The fetch below sends the Authorization header, and on
+        // Jellyfin 12.3 /Videos/{id}/stream answers without one anyway (checked 2026-11-14),
+        // which is also what the Android browser handoff relies on. Keeping the token out of
+        // the URL keeps it out of Traefik's access log and the browser's history.
         // A single codec is sent deliberately: a comma-separated list lets the server silently
         // downgrade while the UI still claims the codec the user picked.
-        const url = `${baseUrl}/Videos/${itemId}/stream.mp4?MediaSourceId=${mediaSourceId}&VideoBitrate=${selectedBitrate}&VideoCodec=${videoCodec}&AudioCodec=${audioCodec}&MaxAudioChannels=2&allowVideoStreamCopy=false&allowAudioStreamCopy=false&Static=false&PlaySessionId=${playSessionId}&DeviceId=${encodeURIComponent(deviceId)}&api_key=${token}`;
+        const url = `${baseUrl}/Videos/${itemId}/stream.mp4?MediaSourceId=${mediaSourceId}&VideoBitrate=${selectedBitrate}&VideoCodec=${videoCodec}&AudioCodec=${audioCodec}&MaxAudioChannels=2&allowVideoStreamCopy=false&allowAudioStreamCopy=false&Static=false&PlaySessionId=${playSessionId}&DeviceId=${encodeURIComponent(deviceId)}`;
         // Nothing below this point applies inside the Android app: there is no queue entry, no
         // progress and no filename of ours once the browser owns the transfer.
         if (isAndroidAppWebView()) {
@@ -1061,7 +1072,7 @@
             return;
         }
 
-        const stopUrl = buildStopUrl(baseUrl, deviceId, playSessionId, token);
+        const stopUrl = buildStopUrl(baseUrl, deviceId, playSessionId);
 
         const videoTag = codecTag(VIDEO_CODECS, videoCodec);
         const audioTag = codecTag(AUDIO_CODECS, audioCodec);
@@ -1086,6 +1097,7 @@
             estimatedBytes,
             url,
             stopUrl,
+            token,
             videoCodec,
             audioCodec,
             codecLabel: `${videoTag} · ${formatBitrate(selectedBitrate)} · ${audioTag}`,
