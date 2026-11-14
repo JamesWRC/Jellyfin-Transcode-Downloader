@@ -22,5 +22,6 @@
     "ServerBusyTryLater": "The server is busy with other downloads. Try again in a minute.",
     "TimeLeft": "~{time} left",
     "DownloadIncomplete": "Download incomplete — the server stopped at {done} of {total}. Not saved; try again and keep this page open.",
-    "SentToAppDownloads": "Sent to the Jellyfin app's Downloads. It appears there when finished."
+    "SentToAppDownloads": "Sent to the Jellyfin app's Downloads. It appears there when finished.",
+    "DownloadIncompleteNoTime": "Download incomplete — the server stopped before the end. Not saved; try again and keep this page open."
 }

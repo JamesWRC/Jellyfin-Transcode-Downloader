@@ -126,14 +126,16 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                     outputBytes = new System.IO.FileInfo(job.Path).Length;
                 }
 
-                // ffmpeg reports progress about twice a second, so at 30x the last report can trail
-                // the real end by ~15 s of content; a stop part-way is minutes short.
-                var encodedToEnd = job is not null && job.HasExited && (runtime <= 0 || encoded >= runtime - 60);
+                // Jellyfin does not keep a progressive job's position once ffmpeg exits (it reads 0),
+                // so judge by the job list instead. A job Jellyfin stopped early (a kill request, the
+                // kill timer) is removed from the list; one whose ffmpeg ran to the end stays in it,
+                // exited, until someone kills it, which is what happens next.
+                var encodedToEnd = job is not null && job.HasExited && job.ExitCode == 0;
                 var allSent = outputBytes > 0 && slot.BytesSent >= outputBytes;
                 var result = new DownloadResult
                 {
                     UserId = slot.UserId,
-                    Known = job is not null,
+                    Known = true,
                     Complete = encodedToEnd && allSent,
                     EncodedSeconds = Math.Round(encoded),
                     RuntimeSeconds = Math.Round(runtime),

@@ -110,6 +110,7 @@
         BrowserHandoffFailed: 'Could not open your browser.',
         WaitingForOwnDownload: 'Waiting for your other download to finish…',
         DownloadIncomplete: 'Download incomplete — the server stopped at {done} of {total}. Not saved; try again and keep this page open.',
+        DownloadIncompleteNoTime: 'Download incomplete — the server stopped before the end. Not saved; try again and keep this page open.',
         SentToAppDownloads: "Sent to the Jellyfin app's Downloads. It appears there when finished.",
         WaitingForServerSlot: 'Server busy — waiting for a free download slot…',
         NoSpace: 'The server has no room for this download right now. Try a lower quality, or try again later.',
@@ -440,9 +441,13 @@
                 const outcome = await fetchDownloadResult(entry);
                 if (outcome && readField(outcome, 'Known') && !readField(outcome, 'Complete')) {
                     const incomplete = new Error('incomplete');
-                    incomplete.userMessage = t('DownloadIncomplete')
-                        .replace('{done}', formatClock(readField(outcome, 'EncodedSeconds')))
-                        .replace('{total}', formatClock(readField(outcome, 'RuntimeSeconds')));
+                    // The share of bytes received is the best position estimate: Jellyfin does not
+                    // keep the encode position once ffmpeg has exited.
+                    const runtime = Number(readField(outcome, 'RuntimeSeconds')) || 0;
+                    const share = entry.estimatedBytes ? Math.min(1, entry.receivedBytes / entry.estimatedBytes) : 0;
+                    incomplete.userMessage = runtime && share
+                        ? t('DownloadIncomplete').replace('{done}', `~${formatClock(runtime * share)}`).replace('{total}', formatClock(runtime))
+                        : t('DownloadIncompleteNoTime');
                     throw incomplete;
                 }
                 triggerBlobDownload(blob, entry.filename);
