@@ -111,6 +111,8 @@
         WaitingForOwnDownload: 'Waiting for your other download to finish…',
         DownloadIncomplete: 'Download incomplete — the server stopped at {done} of {total}. Not saved; try again and keep this page open.',
         DownloadIncompleteNoTime: 'Download incomplete — the server stopped before the end. Not saved; try again and keep this page open.',
+        CodecNotApplePlayable: "won't play in Apple's players — use H.264 / AAC",
+        IosAppHint: 'Turn off "Transcoded Downloads" in the app\'s settings, or the app ignores the quality you pick here. Finished downloads open in Files.',
         SentToAppDownloads: "Sent to the Jellyfin app's Downloads. It appears there when finished.",
         WaitingForServerSlot: 'Server busy — waiting for a free download slot…',
         NoSpace: 'The server has no room for this download right now. Try a lower quality, or try again later.',
@@ -857,7 +859,21 @@
     }
 
     // Why a codec cannot be used, or null when it can.
+    // Apple's own players (Files, QuickTime, Photos) play HEVC in MP4 only when it is
+    // tagged hvc1, and Jellyfin writes progressive HEVC as hev1 (checked 2026-11-14: a download
+    // opened from the iOS app's Downloads played only in VLC). Opus in MP4 is the same. Jellyfin
+    // has no parameter to change the tag, so Apple devices get the formats they can play.
+    const APPLE_PLAYABLE = { video: ['h264'], audio: ['aac'] };
+
+    function isApplePlayback() {
+        const ua = navigator.userAgent || '';
+        // iPadOS Safari reports itself as a Mac; touch support gives it away.
+        return isIosApp() || /iPhone|iPad|iPod/.test(ua)
+            || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    }
+
     function codecBlockReason(kind, id) {
+        if (isApplePlayback() && !APPLE_PLAYABLE[kind].includes(id)) return 'apple';
         if (!codecCapabilities) return null;
         const capability = codecCapabilities[kind][id];
         if (!capability) return 'unsupported';
@@ -867,6 +883,7 @@
     }
 
     function codecReasonText(reason) {
+        if (reason === 'apple') return t('CodecNotApplePlayable');
         return reason === 'admin' ? t('CodecDisabledByAdmin') : t('CodecUnsupported');
     }
 
@@ -1223,6 +1240,16 @@
 
         // Said before the choice, not after: picking a tier in the app leaves for the browser
         // immediately, and a transcode that surprises the user has already cost server time.
+        // With the app's "Transcoded Downloads" switch on, the app ignores the URL it is
+        // handed and runs its own unpaced transcode at a quality it picks (seen 2026-11-14:
+        // 2.4 GB at ~171 Mbps for a 164 MB pick). The page cannot read that setting.
+        if (isIosApp()) {
+            const appHint = document.createElement('div');
+            appHint.style.cssText = 'padding:0 20px 8px;font-size:12px;color:#d0a24c;';
+            appHint.textContent = t('IosAppHint');
+            sheet.appendChild(appHint);
+        }
+
         if (isAndroidAppWebView()) {
             const handoffHint = document.createElement('div');
             handoffHint.style.cssText = 'padding:0 20px 8px;font-size:12px;color:#d0a24c;';
