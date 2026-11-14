@@ -58,9 +58,6 @@ namespace Jellyfin.Plugin.TranscodeDownloader
         /// <summary>The encode reached the end of the item and the client was sent all of it.</summary>
         public bool Complete { get; init; }
 
-        /// <summary>False when the transcoding job was already gone and completeness could not be judged.</summary>
-        public bool Known { get; init; }
-
         public double EncodedSeconds { get; init; }
 
         public double RuntimeSeconds { get; init; }

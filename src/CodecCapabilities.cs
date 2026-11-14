@@ -65,10 +65,6 @@ namespace Jellyfin.Plugin.TranscodeDownloader
         public string Reason { get; set; } = string.Empty;
 
         public int RetryAfterSeconds { get; set; }
-
-        public long NeededBytes { get; set; }
-
-        public long FreeBytes { get; set; }
     }
 
     /// <summary>

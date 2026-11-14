@@ -116,6 +116,7 @@
         SentToAppDownloads: "Sent to the Jellyfin app's Downloads. It appears there when finished.",
         WaitingForServerSlot: 'Server busy — waiting for a free download slot…',
         NoSpace: 'The server has no room for this download right now. Try a lower quality, or try again later.',
+        OwnDownloadRunning: 'You already have a download running. Try again when it finishes.',
         ServerBusyTryLater: 'The server is busy with other downloads. Try again in a minute.',
         TimeLeft: '~{time} left',
     };
@@ -263,12 +264,26 @@
         return null; // unknown: save rather than throw away a download that may be fine
     }
 
+    // The share of bytes received is the best position estimate: Jellyfin does not keep the
+    // encode position once ffmpeg has exited.
+    function incompleteMessage(entry, outcome) {
+        const runtime = Number(readField(outcome, 'RuntimeSeconds')) || 0;
+        const share = entry.estimatedBytes ? Math.min(1, (entry.receivedBytes || 0) / entry.estimatedBytes) : 0;
+        return runtime && share
+            ? t('DownloadIncomplete').replace('{done}', `~${formatClock(runtime * share)}`).replace('{total}', formatClock(runtime))
+            : t('DownloadIncompleteNoTime');
+    }
+
     function formatClock(seconds) {
         const total = Math.max(0, Math.round(Number(seconds) || 0));
         const h = Math.floor(total / 3600);
         const m = Math.floor((total % 3600) / 60);
         const sec = String(total % 60).padStart(2, '0');
         return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+    }
+
+    function busyNotice(body) {
+        return t(readField(body, 'Reason') === 'user_busy' ? 'OwnDownloadRunning' : 'ServerBusyTryLater');
     }
 
     function waitFor(ms, signal) {
@@ -441,21 +456,20 @@
                 // A transcode stopped part-way still ends the response cleanly, so ask the server
                 // whether the encode reached the end before saving what may be half a film.
                 const outcome = await fetchDownloadResult(entry);
-                if (outcome && readField(outcome, 'Known') && !readField(outcome, 'Complete')) {
+                if (outcome && readField(outcome, 'Complete') === false) {
                     const incomplete = new Error('incomplete');
-                    // The share of bytes received is the best position estimate: Jellyfin does not
-                    // keep the encode position once ffmpeg has exited.
-                    const runtime = Number(readField(outcome, 'RuntimeSeconds')) || 0;
-                    const share = entry.estimatedBytes ? Math.min(1, entry.receivedBytes / entry.estimatedBytes) : 0;
-                    incomplete.userMessage = runtime && share
-                        ? t('DownloadIncomplete').replace('{done}', `~${formatClock(runtime * share)}`).replace('{total}', formatClock(runtime))
-                        : t('DownloadIncompleteNoTime');
+                    incomplete.userMessage = incompleteMessage(entry, outcome);
                     throw incomplete;
                 }
                 triggerBlobDownload(blob, entry.filename);
                 updateEntryProgress(entry, 1, entry.estimatedBytes);
                 await new Promise(r => setTimeout(r, 1000));
             } catch (err) {
+                // The server breaks the connection of a download it knows is incomplete; say why.
+                if (err.name !== 'AbortError' && !err.userMessage && !err.status && entry.ticket) {
+                    const outcome = await fetchDownloadResult(entry);
+                    if (outcome && readField(outcome, 'Complete') === false) err.userMessage = incompleteMessage(entry, outcome);
+                }
                 if (err.name !== 'AbortError') {
                     console.error('[TranscodeDownloader] Download failed:', err);
                     updateEntryStatus(entry, describeFailure(entry, err));
@@ -673,7 +687,7 @@
             showTransientNotice(t('DownloadFailed'));
             return;
         }
-        if (result.status === 429) { showTransientNotice(t('ServerBusyTryLater')); return; }
+        if (result.status === 429) { showTransientNotice(busyNotice(result.body)); return; }
         if (result.status === 507) { showTransientNotice(t('NoSpace')); return; }
         if (result.status !== 200 || !result.body) {
             showTransientNotice(t('DownloadFailedStatus').replace('{status}', result.status));
@@ -701,16 +715,17 @@
             showTransientNotice(t('DownloadFailed'));
             return;
         }
-        if (result.status === 429) { showTransientNotice(t('ServerBusyTryLater')); return; }
+        if (result.status === 429) { showTransientNotice(busyNotice(result.body)); return; }
         if (result.status === 507) { showTransientNotice(t('NoSpace')); return; }
         if (result.status !== 200 || !result.body) {
             showTransientNotice(t('DownloadFailedStatus').replace('{status}', result.status));
             return;
         }
-        // The app refuses a URL without an ApiKey parameter (it keeps the key for the download).
-        // It needs no other auth: Jellyfin serves /Videos/{id}/stream without one.
-        const url = `${request.url}&TdTicket=${encodeURIComponent(readField(result.body, 'Ticket'))}`
-            + `&ApiKey=${encodeURIComponent(request.token)}`;
+        // The app refuses a URL without an ApiKey parameter, but downloading it needs none:
+        // Jellyfin serves /Videos/{id}/stream without auth. A placeholder keeps the user's token
+        // out of proxy and server logs. The app only uses the key for its own "Transcoded
+        // Downloads" path, which then fails visibly instead of running an unpaced transcode.
+        const url = `${request.url}&TdTicket=${encodeURIComponent(readField(result.body, 'Ticket'))}&ApiKey=unused`;
         // Without Path the app names the file from `filename` (ending .mp4) instead of the
         // original's extension (usually .mkv), and files it under ServerId/ItemId.
         const appItem = Object.assign({}, item);

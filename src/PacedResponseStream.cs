@@ -82,8 +82,10 @@ namespace Jellyfin.Plugin.TranscodeDownloader
         public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
             => WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
 
+        // Pacing waits for seconds at a time; blocking a thread for that would starve the server.
+        // Response bodies are written asynchronously, so nothing should call this.
         public override void Write(byte[] buffer, int offset, int count)
-            => WriteAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+            => throw new NotSupportedException("PacedResponseStream is async-only.");
 
         public override void Flush() => _inner.Flush();
 

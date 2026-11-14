@@ -25,5 +25,6 @@
     "SentToAppDownloads": "Sent to the Jellyfin app's Downloads. It appears there when finished.",
     "DownloadIncompleteNoTime": "Download incomplete — the server stopped before the end. Not saved; try again and keep this page open.",
     "CodecNotApplePlayable": "won't play in Apple's players — use H.264 / AAC",
-    "IosAppHint": "Turn off \"Transcoded Downloads\" in the app's settings, or the app ignores the quality you pick here. Finished downloads open in Files."
+    "IosAppHint": "Turn off \"Transcoded Downloads\" in the app's settings, or the app ignores the quality you pick here. Finished downloads open in Files.",
+    "OwnDownloadRunning": "You already have a download running. Try again when it finishes."
 }

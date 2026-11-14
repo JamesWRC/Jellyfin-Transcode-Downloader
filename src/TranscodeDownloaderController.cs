@@ -147,12 +147,8 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                         item.Name,
                         result.NeededBytes,
                         result.FreeBytes);
-                    return StatusCode(StatusCodes.Status507InsufficientStorage, new TicketRefusalDto
-                    {
-                        Reason = "no_space",
-                        NeededBytes = result.NeededBytes,
-                        FreeBytes = result.FreeBytes,
-                    });
+                    // The sizes go to the log only: they describe the server's disks.
+                    return StatusCode(StatusCodes.Status507InsufficientStorage, new TicketRefusalDto { Reason = "no_space" });
 
                 default:
                     Response.Headers["Retry-After"] = RetryAfterSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);

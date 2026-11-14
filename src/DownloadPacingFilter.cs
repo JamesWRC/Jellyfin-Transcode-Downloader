@@ -66,12 +66,15 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                     var slot = _limiter.TryStart(ticketValues.ToString(), itemId);
                     if (slot is null)
                     {
-                        _logger.LogInformation("[TranscodeDownloader] Rejected a stream request with an unknown or expired ticket for item {ItemId}", itemId);
-                        context.Response.StatusCode = StatusCodes.Status403Forbidden;
-                        await context.Response.WriteAsync("Download ticket is unknown or has expired.", context.RequestAborted).ConfigureAwait(false);
+                        // Dropped, not answered: a download manager that ignores the status (the
+                        // Jellyfin iOS app's does) would save an error body as the video. A broken
+                        // connection is a failed download to every client.
+                        _logger.LogInformation("[TranscodeDownloader] Dropped a stream request with an unknown or expired ticket for item {ItemId}", itemId);
+                        context.Abort();
                         return;
                     }
 
+                    DownloadResult? result = null;
                     try
                     {
                         await PacedAsync(context, next, slot.Bucket, slot, "transcode").ConfigureAwait(false);
@@ -80,8 +83,19 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                     {
                         if (_limiter.Release(slot))
                         {
-                            await FinishTranscodeAsync(context, slot).ConfigureAwait(false);
+                            result = await FinishTranscodeAsync(context, slot).ConfigureAwait(false);
                         }
+                    }
+
+                    // A transcode stopped part-way still ends its response cleanly, so the client
+                    // would see a normal end of file. The final chunk is only written once this
+                    // middleware returns, so breaking the connection here turns a truncated
+                    // download into a failed one for every client, including those that never
+                    // ask GET Tickets/{ticket}.
+                    if (result is { Complete: false } && !context.RequestAborted.IsCancellationRequested)
+                    {
+                        _logger.LogInformation("[TranscodeDownloader] Aborting incomplete download {Ticket} so the client cannot keep it", slot.Ticket[..8]);
+                        context.Abort();
                     }
 
                     return;
@@ -103,19 +117,19 @@ namespace Jellyfin.Plugin.TranscodeDownloader
         /// progressive job's file once ffmpeg has exited, and the browser's own stop request cannot be
         /// relied on: a phone may freeze or kill the page first (seen with the iOS app, 2026-11-14).
         /// </summary>
-        private async Task FinishTranscodeAsync(HttpContext context, DownloadSlot slot)
+        private async Task<DownloadResult?> FinishTranscodeAsync(HttpContext context, DownloadSlot slot)
         {
             var playSessionId = context.Request.Query["PlaySessionId"].ToString();
             var deviceId = context.Request.Query["DeviceId"].ToString();
             if (string.IsNullOrEmpty(playSessionId) || string.IsNullOrEmpty(deviceId))
             {
-                return;
+                return null;
             }
 
             try
             {
                 var transcodeManager = context.RequestServices.GetService<ITranscodeManager>();
-                if (transcodeManager is null) return;
+                if (transcodeManager is null) return null;
 
                 var job = transcodeManager.GetTranscodingJob(playSessionId);
                 var runtime = slot.RuntimeTicks / (double)TimeSpan.TicksPerSecond;
@@ -135,7 +149,6 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                 var result = new DownloadResult
                 {
                     UserId = slot.UserId,
-                    Known = true,
                     Complete = encodedToEnd && allSent,
                     EncodedSeconds = Math.Round(encoded),
                     RuntimeSeconds = Math.Round(runtime),
@@ -153,10 +166,12 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                     runtime,
                     slot.BytesSent,
                     outputBytes);
+                return result;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "[TranscodeDownloader] Cleanup after download {Ticket} failed", slot.Ticket[..8]);
+                return null;
             }
         }
 
