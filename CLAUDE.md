@@ -121,7 +121,7 @@ refactors, internal-only changes, or build/tooling fixes.
 ## Tests
 
 Unit tests live in `tests/Jellyfin.Plugin.TranscodeDownloader.Tests` (xunit, net10.0). They need no
-server. There is no .NET on the host, so run them in the SDK container:
+server. No local .NET SDK is needed: build.sh runs everything in the SDK container, or run them directly:
 
 ```
 ./build.sh 1.0.27.1        # tests first, then publish to ./out/pub; refuses to publish when a test fails
