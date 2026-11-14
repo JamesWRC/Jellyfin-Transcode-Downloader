@@ -2,3 +2,6 @@ src/bin/
 src/obj/
 *.user
 demo/__pycache__/
+tests/**/bin/
+tests/**/obj/
+out/

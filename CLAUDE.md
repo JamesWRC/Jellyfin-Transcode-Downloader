@@ -118,6 +118,32 @@ UX flows, new requirements, or removed capabilities. The README is the end-user 
 keep it in sync with `plugin.js` and the C# plugin. Do **not** update it for
 refactors, internal-only changes, or build/tooling fixes.
 
+## Tests
+
+Unit tests live in `tests/Jellyfin.Plugin.TranscodeDownloader.Tests` (xunit, net10.0). They need no
+server. There is no .NET on the host, so run them in the SDK container:
+
+```
+./build.sh 1.0.27.1        # tests first, then publish to ./out/pub; refuses to publish when a test fails
+SKIP_TESTS=1 ./build.sh …  # escape hatch, prints a warning; never for a build you ship
+JELLYFIN_VERSION=12.4.0 ./build.sh …   # check the plugin and tests against another Jellyfin version
+```
+
+`JellyfinVersion` (MSBuild property, default = the pinned version in `src/…csproj`) feeds the Jellyfin
+packages of both the plugin and the tests, so one `-p:JellyfinVersion=X` is the whole upgrade check:
+a Jellyfin API change shows up as a compile error or a red test.
+
+What is covered: `TokenBucket` rate maths and refill, `PacedResponseStream` pacing and cancellation
+(sync `Write` must throw), `DownloadLimiter` slots / space guard / ticket expiry, the completeness rule
+(`DownloadCompleteness.IsComplete`), `DownloadPacingFilter` run in a real ASP.NET pipeline (unknown
+ticket or incomplete download must `Abort()` the connection, never answer with a status code),
+defaults, and the client script. `web/plugin.js` is one closure, so the tests cut named functions
+(`authHeaders`, `isApplePlayback`, `codecBlockReason`, `APPLE_PLAYABLE`) out of the embedded script and
+run them in Jint; renaming one makes the test fail loudly. Keep those names, or update the tests.
+
+The classes take optional clocks / configuration / free-space probes in an extra constructor so tests
+control time and disk; the one-argument constructors behave exactly as before.
+
 ## Release pipeline
 
 Two tag-driven pipelines run independently:
