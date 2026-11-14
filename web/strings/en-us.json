@@ -20,5 +20,7 @@
     "WaitingForServerSlot": "Server busy — waiting for a free download slot…",
     "NoSpace": "The server has no room for this download right now. Try a lower quality, or try again later.",
     "ServerBusyTryLater": "The server is busy with other downloads. Try again in a minute.",
-    "TimeLeft": "~{time} left"
+    "TimeLeft": "~{time} left",
+    "DownloadIncomplete": "Download incomplete — the server stopped at {done} of {total}. Not saved; try again and keep this page open.",
+    "SentToAppDownloads": "Sent to the Jellyfin app's Downloads. It appears there when finished."
 }

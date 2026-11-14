@@ -12,12 +12,13 @@ namespace Jellyfin.Plugin.TranscodeDownloader
     {
         private long _bytesSent;
 
-        public DownloadSlot(string ticket, Guid userId, Guid itemId, long estimatedBytes, TokenBucket bucket)
+        public DownloadSlot(string ticket, Guid userId, Guid itemId, long estimatedBytes, long runtimeTicks, TokenBucket bucket)
         {
             Ticket = ticket;
             UserId = userId;
             ItemId = itemId;
             EstimatedBytes = estimatedBytes;
+            RuntimeTicks = runtimeTicks;
             Bucket = bucket;
             IssuedUtc = DateTime.UtcNow;
         }
@@ -30,6 +31,9 @@ namespace Jellyfin.Plugin.TranscodeDownloader
 
         /// <summary>Estimated output size including the VBR margin.</summary>
         public long EstimatedBytes { get; }
+
+        /// <summary>The item's runtime, to judge whether the encode reached the end.</summary>
+        public long RuntimeTicks { get; }
 
         /// <summary>This download's own rate limit.</summary>
         public TokenBucket Bucket { get; }
@@ -44,6 +48,28 @@ namespace Jellyfin.Plugin.TranscodeDownloader
         public long BytesSent => Interlocked.Read(ref _bytesSent);
 
         public void AddBytes(long count) => Interlocked.Add(ref _bytesSent, count);
+    }
+
+    /// <summary>How a ticketed download ended, as the server saw it.</summary>
+    public sealed class DownloadResult
+    {
+        public Guid UserId { get; init; }
+
+        /// <summary>The encode reached the end of the item and the client was sent all of it.</summary>
+        public bool Complete { get; init; }
+
+        /// <summary>False when the transcoding job was already gone and completeness could not be judged.</summary>
+        public bool Known { get; init; }
+
+        public double EncodedSeconds { get; init; }
+
+        public double RuntimeSeconds { get; init; }
+
+        public long BytesSent { get; init; }
+
+        public long OutputBytes { get; init; }
+
+        public DateTime RecordedUtc { get; init; } = DateTime.UtcNow;
     }
 
     public enum TicketOutcome
@@ -78,6 +104,7 @@ namespace Jellyfin.Plugin.TranscodeDownloader
 
         private readonly object _lock = new object();
         private readonly List<DownloadSlot> _slots = new List<DownloadSlot>();
+        private readonly Dictionary<string, DownloadResult> _results = new Dictionary<string, DownloadResult>();
         private readonly ILogger<DownloadLimiter> _logger;
 
         public DownloadLimiter(ILogger<DownloadLimiter> logger)
@@ -106,7 +133,7 @@ namespace Jellyfin.Plugin.TranscodeDownloader
 
         public TokenBucket NewDownloadBucket() => new TokenBucket(() => ToBytesPerSecond(Config.PerDownloadMbps));
 
-        public TicketResult TryIssue(Guid userId, Guid itemId, long estimatedBytes, string transcodePath)
+        public TicketResult TryIssue(Guid userId, Guid itemId, long estimatedBytes, long runtimeTicks, string transcodePath)
         {
             var config = Config;
             lock (_lock)
@@ -132,7 +159,7 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                     return new TicketResult { Outcome = TicketOutcome.NoSpace, NeededBytes = needed, FreeBytes = free };
                 }
 
-                var slot = new DownloadSlot(Guid.NewGuid().ToString("N"), userId, itemId, estimatedBytes, NewDownloadBucket());
+                var slot = new DownloadSlot(Guid.NewGuid().ToString("N"), userId, itemId, estimatedBytes, runtimeTicks, NewDownloadBucket());
                 _slots.Add(slot);
                 return new TicketResult { Outcome = TicketOutcome.Granted, Slot = slot, FreeBytes = free };
             }
@@ -152,13 +179,37 @@ namespace Jellyfin.Plugin.TranscodeDownloader
             }
         }
 
-        /// <summary>Ends one stream request; the slot is freed when its last request ends.</summary>
-        public void Release(DownloadSlot slot)
+        /// <summary>Ends one stream request. True when it was the slot's last one (the slot is then freed).</summary>
+        public bool Release(DownloadSlot slot)
         {
             lock (_lock)
             {
                 slot.InFlight--;
-                if (slot.InFlight <= 0) _slots.Remove(slot);
+                if (slot.InFlight > 0) return false;
+                _slots.Remove(slot);
+                return true;
+            }
+        }
+
+        public void RecordResult(string ticket, DownloadResult result)
+        {
+            lock (_lock)
+            {
+                var cutoff = DateTime.UtcNow - TimeSpan.FromMinutes(30);
+                foreach (var stale in _results.Where(r => r.Value.RecordedUtc < cutoff).Select(r => r.Key).ToList())
+                {
+                    _results.Remove(stale);
+                }
+
+                _results[ticket] = result;
+            }
+        }
+
+        public DownloadResult? GetResult(string ticket)
+        {
+            lock (_lock)
+            {
+                return _results.TryGetValue(ticket, out var result) ? result : null;
             }
         }
 

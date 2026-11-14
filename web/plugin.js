@@ -109,6 +109,8 @@
         BrowserHandoffStarted: 'Handed to your browser — check its downloads.',
         BrowserHandoffFailed: 'Could not open your browser.',
         WaitingForOwnDownload: 'Waiting for your other download to finish…',
+        DownloadIncomplete: 'Download incomplete — the server stopped at {done} of {total}. Not saved; try again and keep this page open.',
+        SentToAppDownloads: "Sent to the Jellyfin app's Downloads. It appears there when finished.",
         WaitingForServerSlot: 'Server busy — waiting for a free download slot…',
         NoSpace: 'The server has no room for this download right now. Try a lower quality, or try again later.',
         ServerBusyTryLater: 'The server is busy with other downloads. Try again in a minute.',
@@ -212,12 +214,10 @@
         }
     }
 
-    // A closed tab aborts the fetch, which is enough for a still-running ffmpeg (the server's kill
-    // timer takes over) but not for one that already finished — that job needs the same explicit
-    // stop as a completed download.
-    window.addEventListener('pagehide', () => {
-        downloadQueue.forEach(stopActiveEncoding);
-    });
+    // No 'pagehide' stop. iOS fires pagehide when the user merely switches apps or locks
+    // the phone, and stopping there killed a download that was still running (2026-11-14, cut at
+    // 21 of 45 min). The server now stops the transcode and deletes its file itself when the
+    // download's connection ends, so a page that really closes is cleaned up without our help.
 
     // Jellyfin 12 disables legacy authorization, so `?api_key=` and X-Emby-Token are
     // rejected with 401 and only `Authorization: MediaBrowser Token="…"` is accepted. Every
@@ -241,6 +241,31 @@
         let body = null;
         try { body = await res.json(); } catch (_) { /* 4xx/5xx without a body */ }
         return { status: res.status, body };
+    }
+
+    // The server records the result just after the response ends, so a quick first ask can miss it.
+    async function fetchDownloadResult(entry) {
+        for (let attempt = 0; attempt < 6; attempt++) {
+            try {
+                const res = await fetch(`${entry.baseUrl}/TranscodeDownloader/Tickets/${encodeURIComponent(entry.ticket)}`, {
+                    headers: authHeaders(entry.token),
+                });
+                if (res.ok) return await res.json();
+                if (res.status !== 404) return null;
+            } catch (_) {
+                return null;
+            }
+            await new Promise(r => setTimeout(r, 500));
+        }
+        return null; // unknown: save rather than throw away a download that may be fine
+    }
+
+    function formatClock(seconds) {
+        const total = Math.max(0, Math.round(Number(seconds) || 0));
+        const h = Math.floor(total / 3600);
+        const m = Math.floor((total % 3600) / 60);
+        const sec = String(total % 60).padStart(2, '0');
+        return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
     }
 
     function waitFor(ms, signal) {
@@ -400,6 +425,7 @@
                     }
                 }
                 entry.estimatedBytes = Number(readField(ticket, 'EstimatedBytes')) || entry.estimatedBytes;
+                entry.ticket = readField(ticket, 'Ticket');
                 entry.startedAt = Date.now();
                 const url = `${entry.url}&TdTicket=${encodeURIComponent(readField(ticket, 'Ticket'))}`;
                 const response = await fetch(url, { signal, headers: authHeaders(entry.token) });
@@ -409,6 +435,16 @@
                     throw httpError;
                 }
                 const blob = await readStream(response.body, entry.estimatedBytes, entry);
+                // A transcode stopped part-way still ends the response cleanly, so ask the server
+                // whether the encode reached the end before saving what may be half a film.
+                const outcome = await fetchDownloadResult(entry);
+                if (outcome && readField(outcome, 'Known') && !readField(outcome, 'Complete')) {
+                    const incomplete = new Error('incomplete');
+                    incomplete.userMessage = t('DownloadIncomplete')
+                        .replace('{done}', formatClock(readField(outcome, 'EncodedSeconds')))
+                        .replace('{total}', formatClock(readField(outcome, 'RuntimeSeconds')));
+                    throw incomplete;
+                }
                 triggerBlobDownload(blob, entry.filename);
                 updateEntryProgress(entry, 1, entry.estimatedBytes);
                 await new Promise(r => setTimeout(r, 1000));
@@ -638,6 +674,48 @@
         }
         const url = `${request.url}&TdTicket=${encodeURIComponent(readField(result.body, 'Ticket'))}`;
         handOffToBrowser(url, request.baseUrl, deviceId, playSessionId);
+    }
+
+    // The Jellyfin iOS app (jellyfin-expo) hosts jellyfin-web in a WKWebView that cannot
+    // save a page-made download: the blob save at the end left the app on a black screen with no
+    // file (2026-11-14). Its NativeShell.downloadFile() takes any URL, downloads it natively into
+    // the app's Downloads, and keeps going with the page gone. ExpoAppInfo is only defined there.
+    function isIosApp() {
+        const shell = window.NativeShell;
+        return !!(shell && typeof shell.downloadFile === 'function' && window.ExpoAppInfo);
+    }
+
+    async function handOffToIosApp(request, item, filename) {
+        let result;
+        try {
+            result = await requestTicket(request);
+        } catch (err) {
+            console.error('[TranscodeDownloader] ticket request failed:', err);
+            showTransientNotice(t('DownloadFailed'));
+            return;
+        }
+        if (result.status === 429) { showTransientNotice(t('ServerBusyTryLater')); return; }
+        if (result.status === 507) { showTransientNotice(t('NoSpace')); return; }
+        if (result.status !== 200 || !result.body) {
+            showTransientNotice(t('DownloadFailedStatus').replace('{status}', result.status));
+            return;
+        }
+        // The app refuses a URL without an ApiKey parameter (it keeps the key for the download).
+        // It needs no other auth: Jellyfin serves /Videos/{id}/stream without one.
+        const url = `${request.url}&TdTicket=${encodeURIComponent(readField(result.body, 'Ticket'))}`
+            + `&ApiKey=${encodeURIComponent(request.token)}`;
+        // Without Path the app names the file from `filename` (ending .mp4) instead of the
+        // original's extension (usually .mkv), and files it under ServerId/ItemId.
+        const appItem = Object.assign({}, item);
+        delete appItem.Path;
+        try {
+            window.NativeShell.downloadFile({ item: appItem, url, filename });
+        } catch (err) {
+            console.error('[TranscodeDownloader] iOS app hand-off failed:', err);
+            showTransientNotice(t('DownloadFailed'));
+            return;
+        }
+        showTransientNotice(t('SentToAppDownloads'));
     }
 
     function handOffToBrowser(url, baseUrl, deviceId, playSessionId) {
@@ -1166,6 +1244,16 @@
         });
     }
 
+    function filenameFor(item, videoCodec, audioCodec, bitrate) {
+        const suffix = ` [${codecTag(VIDEO_CODECS, videoCodec)} ${formatBitrate(bitrate).replace(' ', '')} ${codecTag(AUDIO_CODECS, audioCodec)}]`;
+        const pad = (n) => String(n).padStart(2, '0');
+        if (item.Type === 'Movie') return `${item.Name} (${item.ProductionYear})${suffix}.mp4`;
+        if (item.Type === 'Episode') {
+            return `${item.SeriesName} S${pad(item.ParentIndexNumber)}E${pad(item.IndexNumber)} - ${item.Name}${suffix}.mp4`;
+        }
+        return `download${suffix}.mp4`;
+    }
+
     function addToQueue(baseUrl, itemId, token, selectedBitrate, item, videoCodec, audioCodec) {
         const mediaSourceId = item.MediaSources && item.MediaSources[0] && item.MediaSources[0].Id
             ? item.MediaSources[0].Id
@@ -1190,22 +1278,16 @@
             handOffWithTicket({ baseUrl, itemId, token, bitrate: selectedBitrate, url }, deviceId, playSessionId);
             return;
         }
+        if (isIosApp()) {
+            handOffToIosApp({ baseUrl, itemId, token, bitrate: selectedBitrate, url }, item, filenameFor(item, videoCodec, audioCodec, selectedBitrate));
+            return;
+        }
 
         const stopUrl = buildStopUrl(baseUrl, deviceId, playSessionId);
 
         const videoTag = codecTag(VIDEO_CODECS, videoCodec);
         const audioTag = codecTag(AUDIO_CODECS, audioCodec);
-        const suffix = ` [${videoTag} ${formatBitrate(selectedBitrate).replace(' ', '')} ${audioTag}]`;
-
-        const pad = (n) => String(n).padStart(2, '0');
-        let filename;
-        if (item.Type === 'Movie') {
-            filename = `${item.Name} (${item.ProductionYear})${suffix}.mp4`;
-        } else if (item.Type === 'Episode') {
-            filename = `${item.SeriesName} S${pad(item.ParentIndexNumber)}E${pad(item.IndexNumber)} - ${item.Name}${suffix}.mp4`;
-        } else {
-            filename = `download${suffix}.mp4`;
-        }
+        const filename = filenameFor(item, videoCodec, audioCodec, selectedBitrate);
 
         const durationSeconds = item.RunTimeTicks / 10_000_000;
         const estimatedBytes = (selectedBitrate * durationSeconds) / 8;

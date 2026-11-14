@@ -119,7 +119,7 @@ namespace Jellyfin.Plugin.TranscodeDownloader
             var seconds = (item.RunTimeTicks ?? 0) / (double)TimeSpan.TicksPerSecond;
             var estimatedBytes = (long)((videoBitrate + AudioBitrate) * seconds / 8);
 
-            var result = _limiter.TryIssue(userId, item.Id, (long)(estimatedBytes * SizeMargin), _configurationManager.GetTranscodePath());
+            var result = _limiter.TryIssue(userId, item.Id, (long)(estimatedBytes * SizeMargin), item.RunTimeTicks ?? 0, _configurationManager.GetTranscodePath());
             switch (result.Outcome)
             {
                 case TicketOutcome.Granted:
@@ -162,6 +162,32 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                         RetryAfterSeconds = RetryAfterSeconds,
                     });
             }
+        }
+
+        /// <summary>
+        /// GET /TranscodeDownloader/Tickets/{ticket} — how a finished download ended: whether the
+        /// encode reached the end and the client was sent all of it. A transcode stopped early still
+        /// ends its HTTP response cleanly, so without this a truncated file looks like a success.
+        /// 404 until the download has ended (or for another user's ticket).
+        /// </summary>
+        [HttpGet("Tickets/{ticket}")]
+        [Authorize]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public ActionResult<DownloadResult> GetTicketResult([FromRoute] string ticket)
+        {
+            if (!Guid.TryParse(User.FindFirst(UserIdClaim)?.Value, out var userId))
+            {
+                return Forbid();
+            }
+
+            var result = _limiter.GetResult(ticket);
+            if (result is null || result.UserId != userId)
+            {
+                return NotFound();
+            }
+
+            return result;
         }
 
         /// <summary>The rate this client's download would get on its own, in bps; 0 when it is not paced.</summary>
