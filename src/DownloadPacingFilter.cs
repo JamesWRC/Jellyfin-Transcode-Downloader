@@ -144,12 +144,10 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                 // so judge by the job list instead. A job Jellyfin stopped early (a kill request, the
                 // kill timer) is removed from the list; one whose ffmpeg ran to the end stays in it,
                 // exited, until someone kills it, which is what happens next.
-                var encodedToEnd = job is not null && job.HasExited && job.ExitCode == 0;
-                var allSent = outputBytes > 0 && slot.BytesSent >= outputBytes;
                 var result = new DownloadResult
                 {
                     UserId = slot.UserId,
-                    Complete = encodedToEnd && allSent,
+                    Complete = DownloadCompleteness.IsComplete(job is not null, job?.HasExited ?? false, job?.ExitCode, slot.BytesSent, outputBytes),
                     EncodedSeconds = Math.Round(encoded),
                     RuntimeSeconds = Math.Round(runtime),
                     BytesSent = slot.BytesSent,

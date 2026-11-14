@@ -20,7 +20,6 @@ namespace Jellyfin.Plugin.TranscodeDownloader
             EstimatedBytes = estimatedBytes;
             RuntimeTicks = runtimeTicks;
             Bucket = bucket;
-            IssuedUtc = DateTime.UtcNow;
         }
 
         public string Ticket { get; }
@@ -38,7 +37,7 @@ namespace Jellyfin.Plugin.TranscodeDownloader
         /// <summary>This download's own rate limit.</summary>
         public TokenBucket Bucket { get; }
 
-        public DateTime IssuedUtc { get; }
+        public DateTime IssuedUtc { get; init; } = DateTime.UtcNow;
 
         /// <summary>Stream requests currently using this slot (a browser may retry or overlap one).</summary>
         public int InFlight { get; set; }
@@ -103,11 +102,27 @@ namespace Jellyfin.Plugin.TranscodeDownloader
         private readonly List<DownloadSlot> _slots = new List<DownloadSlot>();
         private readonly Dictionary<string, DownloadResult> _results = new Dictionary<string, DownloadResult>();
         private readonly ILogger<DownloadLimiter> _logger;
+        private readonly Func<PluginConfiguration> _config;
+        private readonly Func<string, long> _freeBytes;
+        private readonly Func<DateTime> _utcNow;
 
         public DownloadLimiter(ILogger<DownloadLimiter> logger)
+            : this(logger, null, null, null)
+        {
+        }
+
+        /// <summary>
+        /// Same limiter with its configuration, free-space probe and clock replaceable, so the slot
+        /// and space rules can be tested without a server or a disk. A null argument means the real
+        /// thing: the plugin's configuration, the transcode folder's drive, and the system clock.
+        /// </summary>
+        public DownloadLimiter(ILogger<DownloadLimiter> logger, Func<PluginConfiguration>? config, Func<string, long>? freeBytes, Func<DateTime>? utcNow)
         {
             _logger = logger;
-            TotalBucket = new TokenBucket(() => ToBytesPerSecond(Config.TotalMbps));
+            _config = config ?? (() => Config);
+            _freeBytes = freeBytes ?? GetFreeBytes;
+            _utcNow = utcNow ?? (() => DateTime.UtcNow);
+            TotalBucket = new TokenBucket(() => ToBytesPerSecond(_config().TotalMbps));
         }
 
         public static PluginConfiguration Config => Plugin.Instance?.Configuration ?? new PluginConfiguration();
@@ -128,11 +143,11 @@ namespace Jellyfin.Plugin.TranscodeDownloader
             return Math.Min(per, total);
         }
 
-        public TokenBucket NewDownloadBucket() => new TokenBucket(() => ToBytesPerSecond(Config.PerDownloadMbps));
+        public TokenBucket NewDownloadBucket() => new TokenBucket(() => ToBytesPerSecond(_config().PerDownloadMbps));
 
         public TicketResult TryIssue(Guid userId, Guid itemId, long estimatedBytes, long runtimeTicks, string transcodePath)
         {
-            var config = Config;
+            var config = _config();
             lock (_lock)
             {
                 PurgeExpired();
@@ -148,7 +163,7 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                 }
 
                 // What the running downloads have still to write, plus this one, plus headroom.
-                var free = GetFreeBytes(transcodePath);
+                var free = _freeBytes(transcodePath);
                 var pending = _slots.Sum(s => Math.Max(0, s.EstimatedBytes - s.BytesSent));
                 var needed = estimatedBytes + pending + (long)(Math.Max(0, config.HeadroomGb) * 1_000_000_000);
                 if (free >= 0 && free < needed)
@@ -156,7 +171,10 @@ namespace Jellyfin.Plugin.TranscodeDownloader
                     return new TicketResult { Outcome = TicketOutcome.NoSpace, NeededBytes = needed, FreeBytes = free };
                 }
 
-                var slot = new DownloadSlot(Guid.NewGuid().ToString("N"), userId, itemId, estimatedBytes, runtimeTicks, NewDownloadBucket());
+                var slot = new DownloadSlot(Guid.NewGuid().ToString("N"), userId, itemId, estimatedBytes, runtimeTicks, NewDownloadBucket())
+                {
+                    IssuedUtc = _utcNow(),
+                };
                 _slots.Add(slot);
                 return new TicketResult { Outcome = TicketOutcome.Granted, Slot = slot, FreeBytes = free };
             }
@@ -192,7 +210,7 @@ namespace Jellyfin.Plugin.TranscodeDownloader
         {
             lock (_lock)
             {
-                var cutoff = DateTime.UtcNow - TimeSpan.FromMinutes(30);
+                var cutoff = _utcNow() - TimeSpan.FromMinutes(30);
                 foreach (var stale in _results.Where(r => r.Value.RecordedUtc < cutoff).Select(r => r.Key).ToList())
                 {
                     _results.Remove(stale);
@@ -220,7 +238,7 @@ namespace Jellyfin.Plugin.TranscodeDownloader
 
         private void PurgeExpired()
         {
-            var cutoff = DateTime.UtcNow - TicketTtl;
+            var cutoff = _utcNow() - TicketTtl;
             _slots.RemoveAll(s => !s.Started && s.IssuedUtc < cutoff);
         }
 

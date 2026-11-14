@@ -1,7 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <!-- Compiled against Jellyfin 12.3 (net10.0). -->
+    <!-- Compiled against Jellyfin 12.3 (net10.0). Override with -p:JellyfinVersion=X to check
+         the plugin against another server version; the tests project follows the same property. -->
+    <JellyfinVersion Condition="'$(JellyfinVersion)' == ''">12.3.0</JellyfinVersion>
     <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>Jellyfin.Plugin.TranscodeDownloader</AssemblyName>
     <RootNamespace>Jellyfin.Plugin.TranscodeDownloader</RootNamespace>
@@ -17,11 +19,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Jellyfin SDK references — not bundled into the output (provided at runtime by Jellyfin itself).
-         Aligned to 10.11.8, the targeted ABI floor. -->
-    <PackageReference Include="Jellyfin.Model" Version="12.3.0" PrivateAssets="All" />
-    <PackageReference Include="Jellyfin.Common" Version="12.3.0" PrivateAssets="All" />
-    <PackageReference Include="Jellyfin.Controller" Version="12.3.0" PrivateAssets="All" />
+    <!-- Jellyfin SDK references — not bundled into the output (provided at runtime by Jellyfin itself). -->
+    <PackageReference Include="Jellyfin.Model" Version="$(JellyfinVersion)" PrivateAssets="All" />
+    <PackageReference Include="Jellyfin.Common" Version="$(JellyfinVersion)" PrivateAssets="All" />
+    <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinVersion)" PrivateAssets="All" />
     <!-- Newtonsoft JObject is the parameter type of the File Transformation plugin's
          RegisterTransformation(JObject) entry point. Jellyfin ships Newtonsoft at
          runtime, so this is reference-only (PrivateAssets=All). -->
